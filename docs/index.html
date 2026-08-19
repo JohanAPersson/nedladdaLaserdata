@@ -85,7 +85,7 @@ button,input,select{font:inherit;color:inherit}
   text-transform:uppercase;color:#9AA096;margin-bottom:4px;display:block}
 
 ul.tiles{list-style:none;margin:0;padding:0}
-ul.tiles li{display:flex;align-items:center;gap:10px;padding:9px 0;
+ul.tiles li{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:9px 0;
   border-bottom:1px solid var(--line)}
 ul.tiles li:last-child{border-bottom:none}
 ul.tiles .id{font-family:var(--mono);font-size:13px;font-weight:500;flex:1 1 auto;min-width:0}
@@ -98,6 +98,10 @@ ul.tiles a.dl:hover{background:var(--ink);color:var(--paper)}
 ul.tiles button.x{appearance:none;background:none;border:none;cursor:pointer;
   color:var(--muted);font-size:17px;line-height:1;padding:2px 4px}
 ul.tiles button.x:hover{color:var(--signal)}
+ul.tiles .filelist{width:100%;display:flex;flex-direction:column;gap:6px;
+  margin:2px 0 0;padding:8px 0 0;border-top:1px dashed var(--line)}
+ul.tiles .filerow{display:flex;align-items:center;gap:10px}
+ul.tiles .filerow .fsz{flex:1 1 auto;font-family:var(--mono);font-size:11.5px;color:var(--muted)}
 
 .msg{font-size:13px;line-height:1.5;padding:10px 12px;border-left:3px solid var(--muted);
   background:var(--paper-2)}
@@ -168,11 +172,11 @@ pre.out{margin:0;max-height:240px;overflow:auto;background:var(--ink);color:#DDE
 
       <section class="sec" id="dlsec" hidden>
         <p class="eyebrow">Ladda ned</p>
-        <button class="cta" id="dlall">Ladda ned alla rutor</button>
+        <button class="cta" id="dlall">Ladda ned alla filer</button>
         <ol class="steps" style="margin-top:14px">
           <li>Första filen får webbläsaren att fråga efter <b>användarnamn och lösenord</b>. Använd uppgifterna för ditt systemkonto i Geotorget.</li>
           <li>Fyll i en gång — resten av filerna går igenom automatiskt.</li>
-          <li>Filerna hamnar där webbläsaren normalt sparar hämtade filer. En ruta är ofta över 1 GB, så det tar en stund.</li>
+          <li>Filerna hamnar där webbläsaren normalt sparar hämtade filer. En ruta är ofta över 1 GB, så det tar en stund. Innehåller en ruta flera filer laddas alla ned.</li>
         </ol>
         <p class="hint">Har du inget systemkonto ännu? Beställ först produkten <b>Laserdata Nedladdning, skog</b> i Geotorget och skapa ett systemkonto där.</p>
       </section>
@@ -188,7 +192,7 @@ pre.out{margin:0;max-height:240px;overflow:auto;background:var(--ink);color:#DDE
           <summary>Öppna filerna i QGIS</summary>
           <p class="hint" style="margin-top:0">Dra den nedladdade <b>.copc.laz</b>-filen rakt in i QGIS-fönstret. Den öppnas direkt utan väntetid, till skillnad från vanliga LAZ-filer.</p>
           <p class="hint">Koordinatsystemet är <b>SWEREF 99 TM</b> i planet och <b>RH 2000</b> i höjd. Sätt projektet till EPSG:3006 så ligger allt rätt.</p>
-          <p class="hint">Har du många rutor: <b>Bearbetning → Point cloud data management → Build virtual point cloud</b> gör dem till ett enda lager.</p>
+          <p class="hint">Har du många rutor — eller flera filer inom samma ruta: <b>Bearbetning → Point cloud data management → Build virtual point cloud</b> gör dem till ett enda lager.</p>
         </details>
       </section>
 
@@ -223,6 +227,12 @@ pre.out{margin:0;max-height:240px;overflow:auto;background:var(--ink);color:#DDE
    vilket gör sidan snabb och oberoende av CORS och inloggning.
 
    Saknas filen faller sidan tillbaka på att fråga API:et direkt.
+
+   OBS: en 10x10 km ruta kan innehålla FLERA STAC-objekt/filer — inte
+   bara flera skanningstillfällen (olika datum) utan ibland flera filer
+   från samma skanningstillfälle (samma datum, olika "o"-prefix). Därför
+   grupperas filer per ruta på det senaste datumet, och ALLA filer med
+   det datumet tas med — inte bara en av dem.
    ══════════════════════════════════════════════════════════════════════ */
 var INDEX_URL = "data/rutor.json";
 var API       = "https://api.lantmateriet.se/stac-hojd/v1";
@@ -238,7 +248,7 @@ var toWgs    = proj4("EPSG:3006", "EPSG:4326");
 
 var index    = null;    // { "627_57": [{o,d,s}, ...] }
 var source   = "none";  // "index" | "api"
-var chosen   = {};      // nyckel -> { key, entry, alts }
+var chosen   = {};      // nyckel -> { key, entries:[{o,d,s},...], older }
 var dragMode = false;
 
 /* ── karta ──────────────────────────────────────────────────────────── */
@@ -334,19 +344,38 @@ fetch(INDEX_URL, { cache: "no-cache" })
   });
 
 /* ── slå upp filnamn ────────────────────────────────────────────────── */
-function newest(entries) {
-  return entries.slice().sort(function (a, b) {
-    return String(b.d || "").localeCompare(String(a.d || ""));
-  })[0];
+/*
+   Väljer ut ALLA filer som hör till den senaste skanningen i en ruta —
+   inte bara en. Flera STAC-objekt kan dela samma (senaste) datum inom
+   samma 10x10 km-ruta, t.ex. om rutan råkar ligga i skarven mellan två
+   faktiska leveranstilar. Tidigare kod sorterade och plockade bara det
+   sista elementet, vilket tystade bort de andra filerna helt.
+*/
+function newestGroup(entries) {
+  var maxDate = entries.reduce(function (m, e) {
+    var d = String(e.d || "");
+    return d > m ? d : m;
+  }, "");
+  var group = entries.filter(function (e) { return String(e.d || "") === maxDate; });
+
+  // Skydd mot att exakt samma fil (samma organisation + datum) råkar
+  // förekomma dubbelt i indexet/API-svaret.
+  var seen = {}, out = [];
+  group.forEach(function (e) {
+    var dedupeKey = e.o + "|" + e.d;
+    if (!seen[dedupeKey]) { seen[dedupeKey] = true; out.push(e); }
+  });
+  return out;
 }
 
 async function resolve(keys) {
   if (source === "index") {
     var hits = [], miss = [];
     keys.forEach(function (k) {
-      if (index[k] && index[k].length)
-        hits.push({ key:k, entry:newest(index[k]), alts:index[k].length });
-      else miss.push(k);
+      if (index[k] && index[k].length) {
+        var group = newestGroup(index[k]);
+        hits.push({ key:k, entries:group, older: index[k].length - group.length });
+      } else miss.push(k);
     });
     return { hits: hits, miss: miss };
   }
@@ -383,14 +412,23 @@ async function resolve(keys) {
 
   var h = [], ms = [];
   keys.forEach(function (k) {
-    if (byKey[k]) h.push({ key:k, entry:newest(byKey[k]), alts:byKey[k].length });
-    else ms.push(k);
+    if (byKey[k]) {
+      var group = newestGroup(byKey[k]);
+      h.push({ key:k, entries:group, older: byKey[k].length - group.length });
+    } else ms.push(k);
   });
   return { hits: h, miss: ms };
 }
 
 function hrefFor(key, entry) {
   return DL_BASE + entry.o + "/m" + entry.o + "-" + key + ".copc.laz";
+}
+
+// Totalt antal bytes för en ruta. Om ingen fil har känd storlek används
+// EST_BYTES som en grov skattning för hela rutan (inte per fil).
+function keyBytes(c) {
+  var sum = c.entries.reduce(function (s, e) { return s + (e.s || 0); }, 0);
+  return sum > 0 ? sum : EST_BYTES;
 }
 
 function flash(key, color) {
@@ -487,12 +525,13 @@ function fmt(n, d) {
 
 function render() {
   var keys = Object.keys(chosen).sort();
-  var anyReal = keys.some(function (k) { return chosen[k].entry.s > 0; });
+  var anyReal = keys.some(function (k) {
+    return chosen[k].entries.some(function (e) { return e.s > 0; });
+  });
   var est = keys.length > 0 && !anyReal;
-  var total = keys.reduce(function (s, k) {
-    return s + (chosen[k].entry.s || EST_BYTES);
-  }, 0);
+  var total = keys.reduce(function (s, k) { return s + keyBytes(chosen[k]); }, 0);
   var gbTot = total / 1e9;
+  var fileCount = keys.reduce(function (s, k) { return s + chosen[k].entries.length; }, 0);
 
   document.getElementById("tallywrap").hidden = !keys.length;
   document.getElementById("tallyCount").textContent = keys.length;
@@ -517,15 +556,32 @@ function render() {
   }
 
   box.innerHTML = "<ul class='tiles'>" + keys.map(function (k) {
-    var c = chosen[k], sz = c.entry.s;
-    return "<li>" +
-      "<span class='id'>" + k +
-        "<em>" + (c.entry.d || "okänt datum") +
-        (c.alts > 1 ? " · " + c.alts + " skanningar, senaste visas" : "") + "</em></span>" +
-      "<span class='sz'>" + (sz ? fmt(sz/1e9, 2) + " GB" : "≈1,7 GB") + "</span>" +
-      "<a class='dl' href='" + hrefFor(k, c.entry) + "' target='_blank' rel='noopener'>Hämta</a>" +
-      "<button class='x' data-k='" + k + "' title='Ta bort rutan'>×</button>" +
-    "</li>";
+    var c = chosen[k];
+    var multi = c.entries.length > 1;
+    var totalSize = keyBytes(c);
+
+    var meta = (c.entries[0].d || "okänt datum") +
+      (multi ? " · " + c.entries.length + " filer i denna ruta" : "") +
+      (c.older ? " · " + c.older + " äldre skanning" + (c.older > 1 ? "ar" : "") +
+        " dold" + (c.older > 1 ? "a" : "") : "");
+
+    var head =
+      "<span class='id'>" + k + "<em>" + meta + "</em></span>" +
+      "<span class='sz'>" + (totalSize ? fmt(totalSize/1e9, 2) + " GB" : "≈1,7 GB") + "</span>" +
+      (multi ? "" :
+        "<a class='dl' href='" + hrefFor(k, c.entries[0]) + "' target='_blank' rel='noopener'>Hämta</a>") +
+      "<button class='x' data-k='" + k + "' title='Ta bort rutan (alla filer)'>×</button>";
+
+    var fileList = multi
+      ? "<div class='filelist'>" + c.entries.map(function (e) {
+          return "<div class='filerow'>" +
+            "<span class='fsz'>" + (e.s ? fmt(e.s/1e9, 2) + " GB" : "≈okänd storlek") + "</span>" +
+            "<a class='dl' href='" + hrefFor(k, e) + "' target='_blank' rel='noopener'>Hämta (" + e.o + ")</a>" +
+          "</div>";
+        }).join("") + "</div>"
+      : "";
+
+    return "<li>" + head + fileList + "</li>";
   }).join("") + "</ul>";
 
   Array.prototype.forEach.call(box.querySelectorAll("button.x"), function (b) {
@@ -539,31 +595,43 @@ function render() {
     : "";
 
   document.getElementById("dlsec").hidden = false;
+  document.getElementById("dlall").textContent =
+    "Ladda ned alla filer" + (fileCount > keys.length ? " (" + fileCount + " st)" : "");
   document.getElementById("urlbox").textContent =
-    keys.map(function (k) { return hrefFor(k, chosen[k].entry); }).join("\n");
+    keys.reduce(function (lines, k) {
+      chosen[k].entries.forEach(function (e) { lines.push(hrefFor(k, e)); });
+      return lines;
+    }, []).join("\n");
 }
 
 /* ── ladda ned allt ─────────────────────────────────────────────────── */
 document.getElementById("dlall").onclick = function () {
   var keys = Object.keys(chosen).sort();
   if (!keys.length) return;
+
+  var files = [];
+  keys.forEach(function (k) {
+    chosen[k].entries.forEach(function (e) { files.push({ key:k, entry:e }); });
+  });
+  if (!files.length) return;
+
   var btn = this;
   btn.disabled = true;
 
-  keys.forEach(function (k, i) {
+  files.forEach(function (f, i) {
     setTimeout(function () {
       var a = document.createElement("a");
-      a.href = hrefFor(k, chosen[k].entry);
+      a.href = hrefFor(f.key, f.entry);
       a.target = "_blank";
       a.rel = "noopener";
       document.body.appendChild(a);
       a.click();
       a.remove();
-      btn.textContent = "Startar " + (i + 1) + " av " + keys.length + " …";
-      if (i === keys.length - 1) {
+      btn.textContent = "Startar " + (i + 1) + " av " + files.length + " …";
+      if (i === files.length - 1) {
         setTimeout(function () {
           btn.disabled = false;
-          btn.textContent = "Ladda ned alla rutor";
+          render();
         }, 2500);
       }
     }, i * 2000);
